@@ -1,0 +1,284 @@
+name: Build TDLib Java
+
+on:
+  push:
+    branches:
+      - master
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - master
+      - main
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: 'Create a GitHub Release with artifacts'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Java (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-x64
+            archive_ext: tar.gz
+          - os: macos-14
+            platform: macos-arm64
+            archive_ext: tar.gz
+          - os: windows-latest
+            platform: windows-x64
+            archive_ext: zip
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          coverage: none
+
+      - name: Set up swap (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo fallocate -l 4G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=4096
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y make git zlib1g-dev libssl-dev gperf cmake ccache
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install gperf cmake openssl@3 ccache coreutils
+
+      - name: Install dependencies (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install gperf --yes
+          vcpkg install openssl:x64-windows zlib:x64-windows
+
+      - name: Configure ccache
+        if: runner.os != 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-${{ matrix.platform }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ matrix.platform }}-
+
+      # --- Step 1: Prebuild TDLib with JNI support & install to example/java/td ---
+
+      - name: Configure TDLib (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cmake -B jnibuild -DCMAKE_BUILD_TYPE=Release \
+            -DTD_ENABLE_JNI=ON \
+            -DCMAKE_INSTALL_PREFIX="${{ github.workspace }}/example/java/td"
+
+      - name: Configure TDLib (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          OPENSSL_DIR=$(brew --prefix openssl@3)
+          cmake -B jnibuild -DCMAKE_BUILD_TYPE=Release \
+            -DTD_ENABLE_JNI=ON \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DOPENSSL_ROOT_DIR="$OPENSSL_DIR" \
+            -DCMAKE_INSTALL_PREFIX="${{ github.workspace }}/example/java/td"
+
+      - name: Configure TDLib (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cmake -B jnibuild -A x64 -DCMAKE_BUILD_TYPE=Release `
+            -DTD_ENABLE_JNI=ON `
+            -DTD_ENABLE_MULTI_PROCESSOR_COMPILATION=ON `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DCMAKE_INSTALL_PREFIX="${{ github.workspace }}/example/java/td"
+
+      - name: Build & Install TDLib (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: |
+          cmake --build jnibuild --target install -j2
+
+      - name: Build & Install TDLib (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cmake --build jnibuild --target install --config Release --parallel
+
+      # --- Step 2: Build Java wrapper (tdjni, TdApi.java, Client.java) ---
+
+      - name: Configure Java example (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cmake -B example/java/build -DCMAKE_BUILD_TYPE=Release \
+            -DTd_DIR="${{ github.workspace }}/example/java/td/lib/cmake/Td" \
+            -DCMAKE_INSTALL_PREFIX="${{ github.workspace }}/example/java" \
+            example/java
+
+      - name: Configure Java example (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          OPENSSL_DIR=$(brew --prefix openssl@3)
+          cmake -B example/java/build -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DOPENSSL_ROOT_DIR="$OPENSSL_DIR" \
+            -DTd_DIR="${{ github.workspace }}/example/java/td/lib/cmake/Td" \
+            -DCMAKE_INSTALL_PREFIX="${{ github.workspace }}/example/java" \
+            example/java
+
+      - name: Configure Java example (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cmake -B example/java/build -A x64 -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DTd_DIR="${{ github.workspace }}/example/java/td/lib/cmake/Td" `
+            -DCMAKE_INSTALL_PREFIX="${{ github.workspace }}/example/java" `
+            example/java
+
+      - name: Build & Install Java example (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: |
+          cmake --build example/java/build --target install -j2
+
+      - name: Build & Install Java example (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cmake --build example/java/build --target install --config Release --parallel
+
+      # --- Step 3: Package Java classes and source code into JARs ---
+
+      - name: Package JARs (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: |
+          cd "${{ github.workspace }}/example/java/bin"
+          jar -cf tdlib.jar org/drinkless/tdlib/*.class
+          jar -cf tdlib-sources.jar -C "${{ github.workspace }}/example/java" org/drinkless/tdlib/Client.java -C "${{ github.workspace }}/example/java" org/drinkless/tdlib/TdApi.java
+
+      - name: Package JARs (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Set-Location "${{ github.workspace }}/example/java/bin"
+          jar -cf tdlib.jar org/drinkless/tdlib/*.class
+          jar -cf tdlib-sources.jar -C "${{ github.workspace }}/example/java" org/drinkless/tdlib/Client.java -C "${{ github.workspace }}/example/java" org/drinkless/tdlib/TdApi.java
+
+      # --- Step 4: Assemble Dist Directory & Archive ---
+
+      - name: Prepare Artifacts (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: |
+          DIST_DIR="${{ github.workspace }}/dist/tdlib-java-${{ matrix.platform }}"
+          mkdir -p "$DIST_DIR/bin"
+          mkdir -p "$DIST_DIR/lib"
+          mkdir -p "$DIST_DIR/include"
+          mkdir -p "$DIST_DIR/java"
+
+          # Native JNI shared library
+          cp "${{ github.workspace }}/example/java/bin/"libtdjni.* "$DIST_DIR/bin/" 2>/dev/null || true
+
+          # Static libraries & cmake configurations
+          cp -r "${{ github.workspace }}/example/java/td/lib/"*.a "$DIST_DIR/lib/" 2>/dev/null || true
+          cp -r "${{ github.workspace }}/example/java/td/lib/cmake" "$DIST_DIR/lib/" 2>/dev/null || true
+
+          # Headers
+          cp -r "${{ github.workspace }}/example/java/td/include/"* "$DIST_DIR/include/"
+
+          # Java JARs & source files
+          cp "${{ github.workspace }}/example/java/bin/tdlib.jar" "$DIST_DIR/java/"
+          cp "${{ github.workspace }}/example/java/bin/tdlib-sources.jar" "$DIST_DIR/java/"
+          cp "${{ github.workspace }}/example/java/org/drinkless/tdlib/Client.java" "$DIST_DIR/java/"
+          cp "${{ github.workspace }}/example/java/org/drinkless/tdlib/TdApi.java" "$DIST_DIR/java/"
+
+          cd "${{ github.workspace }}/dist"
+          tar -czvf "${{ github.workspace }}/tdlib-java-${{ matrix.platform }}.tar.gz" "tdlib-java-${{ matrix.platform }}"
+
+      - name: Prepare Artifacts (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $DIST_DIR = "${{ github.workspace }}/dist/tdlib-java-${{ matrix.platform }}"
+          New-Item -ItemType Directory -Force -Path "$DIST_DIR/bin"
+          New-Item -ItemType Directory -Force -Path "$DIST_DIR/lib"
+          New-Item -ItemType Directory -Force -Path "$DIST_DIR/include"
+          New-Item -ItemType Directory -Force -Path "$DIST_DIR/java"
+
+          # Native JNI shared library & runtime dlls
+          Copy-Item "${{ github.workspace }}/example/java/bin/*.dll" "$DIST_DIR/bin/" -Force
+
+          # Static libraries (*.lib) & cmake configurations
+          Copy-Item "${{ github.workspace }}/example/java/td/lib/*.lib" "$DIST_DIR/lib/" -Force
+          Copy-Item -Recurse "${{ github.workspace }}/example/java/td/lib/cmake" "$DIST_DIR/lib/" -Force
+
+          # Headers
+          Copy-Item -Recurse "${{ github.workspace }}/example/java/td/include/*" "$DIST_DIR/include/" -Force
+
+          # Java JARs & source files
+          Copy-Item "${{ github.workspace }}/example/java/bin/tdlib.jar" "$DIST_DIR/java/" -Force
+          Copy-Item "${{ github.workspace }}/example/java/bin/tdlib-sources.jar" "$DIST_DIR/java/" -Force
+          Copy-Item "${{ github.workspace }}/example/java/org/drinkless/tdlib/Client.java" "$DIST_DIR/java/" -Force
+          Copy-Item "${{ github.workspace }}/example/java/org/drinkless/tdlib/TdApi.java" "$DIST_DIR/java/" -Force
+
+          Compress-Archive -Path "$DIST_DIR" -DestinationPath "${{ github.workspace }}/tdlib-java-${{ matrix.platform }}.zip" -Force
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tdlib-java-${{ matrix.platform }}
+          path: |
+            ${{ github.workspace }}/tdlib-java-${{ matrix.platform }}.*
+          retention-days: 30
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.create_release == 'true')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ github.workspace }}/artifacts
+
+      - name: Display downloaded files
+        run: ls -laR ${{ github.workspace }}/artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ github.workspace }}/artifacts/**/*.tar.gz
+            ${{ github.workspace }}/artifacts/**/*.zip
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
