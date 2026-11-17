@@ -33,7 +33,7 @@ jobs:
           - os: ubuntu-latest
             platform: linux-x64
             archive_ext: tar.gz
-          - os: macos-14
+          - os: macos-latest
             platform: macos-arm64
             archive_ext: tar.gz
           - os: windows-latest
@@ -44,11 +44,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up JDK 17
+      - name: Set up JDK 25
         uses: actions/setup-java@v4
         with:
-          distribution: 'temurin'
-          java-version: '17'
+          distribution: 'oracle'
+          java-version: '25'
 
       - name: Set up PHP
         uses: shivammathur/setup-php@v2
@@ -59,10 +59,14 @@ jobs:
       - name: Set up swap (Linux)
         if: runner.os == 'Linux'
         run: |
-          sudo fallocate -l 4G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=4096
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
+          if [ ! -f /swapfile_extra ]; then
+            sudo fallocate -l 4G /swapfile_extra 2>/dev/null || sudo dd if=/dev/zero of=/swapfile_extra bs=1M count=4096 2>/dev/null || true
+            if [ -f /swapfile_extra ]; then
+              sudo chmod 600 /swapfile_extra
+              sudo mkswap /swapfile_extra 2>/dev/null || true
+              sudo swapon /swapfile_extra 2>/dev/null || true
+            fi
+          fi
           free -h
 
       - name: Install dependencies (Linux)
